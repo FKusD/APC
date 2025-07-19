@@ -1,0 +1,6 @@
+l1x 17 0x51 vl53l1x_left
+l1x 27 0x52 vl53l1x_right
+l5cx 22 0x53 vl53l5cx_left
+l5cx 23 0x54 vl53l5cx_right
+tcs 24 0x31 tcs_color_left
+tcs 25 0x32 tcs_color_right
