@@ -1,3 +1,13 @@
+
+#define VL53L5CX_DISABLE_AMBIENT_PER_SPAD
+#define VL53L5CX_DISABLE_NB_SPADS_ENABLED
+#define VL53L5CX_DISABLE_NB_TARGET_DETECTED
+#define VL53L5CX_DISABLE_SIGNAL_PER_SPAD
+#define VL53L5CX_DISABLE_RANGE_SIGMA_MM
+// #define VL53L5CX_DISABLE_DISTANCE_MM
+#define VL53L5CX_DISABLE_REFLECTANCE_PERCENT
+// #define VL53L5CX_DISABLE_TARGET_STATUS
+#define VL53L5CX_DISABLE_MOTION_INDICATOR
 #include <VL53L1X_api.h>
 #include <fcntl.h>
 #include <linux/i2c-dev.h>
@@ -305,6 +315,13 @@ int init_vl53l5cx_sensor(uint8_t addr, SensorConfig *sensor_config) {
     free(config);
     return -1;
   }
+
+  status = vl53l5cx_set_ranging_frequency_hz(config, 10);
+	if(status)
+	{
+		printf("vl53l5cx_set_ranging_frequency_hz failed, status %u\n", status);
+		return status;
+	}
 
   // Сохраняем указатель на конфигурацию
   sensor_config->sensor_config = config;
