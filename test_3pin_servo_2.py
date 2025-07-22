@@ -2,7 +2,7 @@ import RPi.GPIO as GPIO
 from time import time, sleep
 
 SERVO_PIN = 18
-
+#
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SERVO_PIN, GPIO.OUT)
 
@@ -13,7 +13,7 @@ pwm.start(0)
 def set_angle(angle):
     duty = angle / 18 + 2
     pwm.ChangeDutyCycle(duty)
-    sleep(0.05)
+    sleep(0.01)
 
 
 class PIDController:
@@ -42,8 +42,8 @@ class PIDController:
         derivative = (error - self.prev_error) / dt if dt > 0 else 0
         D = self.Kd * derivative
         self.prev_error = error
-
         output = current_angle + P + I + D
+        print(output, " ", setpoint, " ", current_angle)
         return max(min(output, self.max_angle), self.min_angle)
 
 
