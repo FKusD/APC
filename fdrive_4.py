@@ -1,4 +1,4 @@
-##!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -123,11 +123,11 @@ class SensorData:
         if self.data_format != 0:  # Матричное измерение
             matrix_size = self.resolution
             distances_end = 8 + matrix_size * 2
-            statuses_end = distances_end + matrix_size
+            statuses_end = 8 + 64 * 2 + matrix_size
 
             distances = struct.unpack(f"<{matrix_size}H", data[8:distances_end])
             statuses = struct.unpack(
-                f"<{matrix_size}B", data[distances_end:statuses_end]
+                f"<{matrix_size}B", data[8 + 64 * 2 : statuses_end]
             )
 
             self.distances = list(distances)
@@ -163,6 +163,7 @@ class SensorReader:
         if shm_name not in self.shm_handles:
             handle = self.open_shared_memory(shm_name)
             if handle is None:
+                print(f"[DEBUG] Не удалось открыть shm {shm_name}")
                 return None
             self.shm_handles[shm_name] = handle
 
@@ -173,10 +174,27 @@ class SensorReader:
             mmap_obj.seek(0)
             header_data = mmap_obj.read(8)
             if len(header_data) < 8:
+                print(f"[DEBUG] Недостаточно данных в заголовке shm {shm_name}")
                 return None
 
-            resolution = struct.unpack("<IBBBB", header_data)[2]
-            data_size = 8 + resolution * 3
+            header = struct.unpack("<IBBBB", header_data)
+            resolution = header[2]
+            data_format = header[3]
+            print(
+                f"[DEBUG] {shm_name}: resolution={resolution}, data_format={data_format}"
+            )
+
+            # Определяем размер данных
+            if data_format == 0:  # Одиночное измерение
+                data_size = 16  # 8 байт заголовка + 8 байт данных
+            else:  # Матричное измерение
+                data_size = (
+                    8 + 64 * 2 + 64
+                )  # 8 байт заголовка + 64*2 (distances) + 64 (statuses)
+                if resolution == 0:
+                    print(f"{shm_name}: Некорректное разрешение (0), пропуск чтения")
+                    sem.release()
+                    return None
 
             mmap_obj.seek(0)
             data = mmap_obj.read(data_size)
@@ -305,6 +323,21 @@ class CarController:
             # Обработка статусов: если статус 255, считаем дистанцию максимальной (4000)
             left_status_row = left_data.statuses[4:8]
             right_status_row = right_data.statuses[4:8]
+
+            left_row = [
+                d if s != 255 else 4000 for d, s in zip(left_row, left_status_row)
+            ]
+            right_row = [
+                d if s != 255 else 4000 for d, s in zip(right_row, right_status_row)
+            ]
+
+            print(
+                f"LEFT status cor: {[f'{v:4d}' for v in left_row]} st: {[f'{v:4d}' for v in left_status_row]}"
+            )
+            print(
+                f"RIGHT status cor: {[f'{v:4d}' for v in right_row]} st: {[f'{v:4d}' for v in right_status_row]}"
+            )
+
             left_row = [
                 d if s != 255 else 4000 for d, s in zip(left_row, left_status_row)
             ]
@@ -339,6 +372,28 @@ class CarController:
 
             # Ограничиваем угол в заданных пределах
             clamped_angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, target_angle))
+
+            # --- Управление скоростью мотора в зависимости от угла поворота ---
+            angle_deviation = abs(clamped_angle - SERVO_CENTER_ANGLE)
+            if angle_deviation <= 8:
+                motor_speed = MOTOR_DRIVE_DC
+            else:
+                # Линейное снижение: при angle_deviation=8 — MOTOR_DRIVE_DC, при max — MOTOR_DRIVE_DC/1.5
+                max_deviation = max(
+                    abs(SERVO_MAX_ANGLE - SERVO_CENTER_ANGLE),
+                    abs(SERVO_MIN_ANGLE - SERVO_CENTER_ANGLE),
+                )
+                min_speed = MOTOR_DRIVE_DC / 1.5
+                # scale: 0 (8°) ... 1 (max_deviation)
+                scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
+                motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
+            self._set_motor_speed(motor_speed)
+            print(
+                f"[DEBUG] MOTOR_SPEED={motor_speed:.2f} (angle_deviation={angle_deviation:.1f})"
+            )
+
+            if ON_RASPBERRY:
+                self._set_servo_angle(clamped_angle)
 
             if ON_RASPBERRY:
                 self._set_servo_angle(clamped_angle)

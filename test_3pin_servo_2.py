@@ -43,7 +43,7 @@ class PIDController:
         D = self.Kd * derivative
         self.prev_error = error
         output = current_angle + P + I + D
-        print(output, " ", setpoint, " ", current_angle)
+        # print(output, " ", setpoint, " ", current_angle)
         return max(min(output, self.max_angle), self.min_angle)
 
 
