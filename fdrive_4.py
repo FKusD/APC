@@ -35,10 +35,13 @@ MOTOR_PIN = 6
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
 MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 15  # Рабочий газ (в процентах)
+MOTOR_DRIVE_DC = 30  # Рабочий газ (в процентах)
 # MOTOR_START_DC = 35 # Начальный газ для старта (в процентах)
 # MOTOR_DRIVE_DC = 20 # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0  # Газ при остановке
+
+# Distance if 255 status
+DSTB = 1800
 
 # Параметры сервопривода
 SERVO_MIN_ANGLE = 70  # Минимальный угол поворота
@@ -60,7 +63,7 @@ PID_COEFFS: List[Tuple[float, float, float]] = [
 
 # Коэффициент масштабирования для рулевого управления
 # Преобразует суммарную ошибку от ПИДов в градусы поворота сервы
-STEERING_SCALING_FACTOR = 0.1
+STEERING_SCALING_FACTOR = 0.11
 
 # --- КЛАСС ПИД-РЕГУЛЯТОРА ---
 
@@ -317,18 +320,18 @@ class CarController:
                 continue
 
             # --- ВЫВОД ЗНАЧЕНИЙ 2-Й СТРОКИ ---
-            print(f"LEFT  2nd row: {[f'{v:4d}' for v in left_row]}")
-            print(f"RIGHT 2nd row: {[f'{v:4d}' for v in right_row]}")
+            # print(f"LEFT  2nd row: {[f'{v:4d}' for v in left_row]}")
+            # print(f"RIGHT 2nd row: {[f'{v:4d}' for v in right_row]}")
 
             # Обработка статусов: если статус 255, считаем дистанцию максимальной (4000)
             left_status_row = left_data.statuses[4:8]
             right_status_row = right_data.statuses[4:8]
 
             left_row = [
-                d if s != 255 else 4000 for d, s in zip(left_row, left_status_row)
+                d if s != 255 else 1500 for d, s in zip(left_row, left_status_row)
             ]
             right_row = [
-                d if s != 255 else 4000 for d, s in zip(right_row, right_status_row)
+                d if s != 255 else 1500 for d, s in zip(right_row, right_status_row)
             ]
 
             print(
@@ -338,12 +341,12 @@ class CarController:
                 f"RIGHT status cor: {[f'{v:4d}' for v in right_row]} st: {[f'{v:4d}' for v in right_status_row]}"
             )
 
-            left_row = [
-                d if s != 255 else 2000 for d, s in zip(left_row, left_status_row)
-            ]
-            right_row = [
-                d if s != 255 else 2000 for d, s in zip(right_row, right_status_row)
-            ]
+            # left_row = [
+            #     d if s != 255 else 1500 for d, s in zip(left_row, left_status_row)
+            # ]
+            # right_row = [
+            #     d if s != 255 else 1500 for d, s in zip(right_row, right_status_row)
+            # ]
 
             total_correction = 0.0
             pid_debug_info = []
@@ -351,27 +354,18 @@ class CarController:
                 # Ошибка = расстояние слева - расстояние справа (для симметричных лучей)
                 dist_left = left_row[i]
                 dist_right = right_row[3 - i]
-                status_left = left_status_row[i]
-                status_right = right_status_row[3 - i]
-
-                # Если хотя бы один статус 255 — пропускаем пару
-                if status_left == 255 or status_right == 255:
-                    pid_debug_info.append((i, None, None, status_left, status_right))
-                    continue
 
                 error = dist_left - dist_right
+
                 # Рассчитываем коррекцию от ПИД-регулятора
                 correction = self.pids[i].compute(setpoint=0, current_value=error)
                 total_correction += correction
-                pid_debug_info.append((i, error, correction, status_left, status_right))
+                pid_debug_info.append((i, error, correction))
 
             # Подробный вывод ошибок и выходов ПИД-регуляторов
             print("PID details:")
-            for idx, err, corr, stl, strr in pid_debug_info:
-                if err is None:
-                    print(f"  PID[{idx}]: SKIPPED (status: {stl}, {strr})")
-                else:
-                    print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f} (status: {stl}, {strr})")
+            for idx, err, corr in pid_debug_info:
+                print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f}")
 
             # Масштабируем и применяем коррекцию к углу сервопривода
             steer_adjustment = total_correction * STEERING_SCALING_FACTOR
