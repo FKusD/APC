@@ -349,20 +349,29 @@ class CarController:
             pid_debug_info = []
             for i in range(4):
                 # Ошибка = расстояние слева - расстояние справа (для симметричных лучей)
-                dist_left = left_row[i] if left_row[i] > 0 else 4000
-                dist_right = right_row[3 - i] if right_row[3 - i] > 0 else 4000
+                dist_left = left_row[i]
+                dist_right = right_row[3 - i]
+                status_left = left_status_row[i]
+                status_right = right_status_row[3 - i]
+
+                # Если хотя бы один статус 255 — пропускаем пару
+                if status_left == 255 or status_right == 255:
+                    pid_debug_info.append((i, None, None, status_left, status_right))
+                    continue
 
                 error = dist_left - dist_right
-
                 # Рассчитываем коррекцию от ПИД-регулятора
                 correction = self.pids[i].compute(setpoint=0, current_value=error)
                 total_correction += correction
-                pid_debug_info.append((i, error, correction))
+                pid_debug_info.append((i, error, correction, status_left, status_right))
 
             # Подробный вывод ошибок и выходов ПИД-регуляторов
             print("PID details:")
-            for idx, err, corr in pid_debug_info:
-                print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f}")
+            for idx, err, corr, stl, strr in pid_debug_info:
+                if err is None:
+                    print(f"  PID[{idx}]: SKIPPED (status: {stl}, {strr})")
+                else:
+                    print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f} (status: {stl}, {strr})")
 
             # Масштабируем и применяем коррекцию к углу сервопривода
             steer_adjustment = total_correction * STEERING_SCALING_FACTOR
