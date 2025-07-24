@@ -12,6 +12,7 @@ import time
 import struct
 import signal
 import sys
+import select
 from typing import Dict, Optional, List, Tuple
 
 # Подавление предупреждений от RPi.GPIO, если он недоступен (например, при разработке на ПК)
@@ -293,6 +294,8 @@ class CarController:
         # --- Режим отладки: 0.3 сек едет (0.08 старт + 0.22 рабочая), 0.7 сек стоит ---
         debug_state = "start"  # 'start', 'drive', 'stop'
         debug_state_time = time.time()
+        # Для управления скоростью с клавиатуры
+        global MOTOR_DRIVE_DC
 
         while self.running:
             # Чтение данных с датчиков
@@ -431,6 +434,13 @@ class CarController:
             #         if ON_RASPBERRY:
             #             self._set_motor_speed(MOTOR_START_DC)
             #             print("[DEBUG] MOTOR START")
+
+            # --- Обработка клавиши 's' для уменьшения скорости на 10 ---
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                key = sys.stdin.read(1)
+                if key.lower() == 's':
+                    MOTOR_DRIVE_DC = max(0, MOTOR_DRIVE_DC - 10)
+                    print(f"[KEYBOARD] MOTOR_DRIVE_DC set to {MOTOR_DRIVE_DC}")
 
             print(
                 f"L: {left_row[3]} R: {right_row[0]} | Err: {error:.0f} | Adj: {steer_adjustment:.2f} | Angle: {clamped_angle:.1f}"
