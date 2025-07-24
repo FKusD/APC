@@ -12,13 +12,15 @@ import time
 import struct
 import signal
 import sys
-import select
 from typing import Dict, Optional, List, Tuple
 
 # Подавление предупреждений от RPi.GPIO, если он недоступен (например, при разработке на ПК)
 # try:
 import RPi.GPIO as GPIO
 import posix_ipc
+import tty
+import termios
+import threading
 
 ON_RASPBERRY = True
 # except (ImportError, ModuleNotFoundError):
@@ -279,7 +281,7 @@ class CarController:
         """Основной цикл управления."""
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
-
+        
         print("Starting car controller...")
         if ON_RASPBERRY:
             self._set_servo_angle(SERVO_CENTER_ANGLE)
@@ -288,14 +290,33 @@ class CarController:
             time.sleep(0.5)
             self._set_motor_speed(MOTOR_DRIVE_DC)
             print(f"Motor running at {MOTOR_DRIVE_DC}% duty cycle.")
-
+        
         print("Corridor following started. Press Ctrl+C to stop.")
+        
+        # --- Обработка клавиши 's' для уменьшения скорости ---
+        def getch():
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                ch = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            return ch
+
+        import threading
+        self._drive_dc = MOTOR_DRIVE_DC
+        def key_listener():
+            while self.running:
+                ch = getch()
+                if ch.lower() == 's':
+                    self._drive_dc = max(0, self._drive_dc - 10)
+                    print(f"[KEY] MOTOR_DRIVE_DC set to {self._drive_dc}")
+        threading.Thread(target=key_listener, daemon=True).start()
 
         # --- Режим отладки: 0.3 сек едет (0.08 старт + 0.22 рабочая), 0.7 сек стоит ---
         debug_state = "start"  # 'start', 'drive', 'stop'
         debug_state_time = time.time()
-        # Для управления скоростью с клавиатуры
-        global MOTOR_DRIVE_DC
 
         while self.running:
             # Чтение данных с датчиков
@@ -380,23 +401,17 @@ class CarController:
             clamped_angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, target_angle))
 
             # --- Управление скоростью мотора в зависимости от угла поворота ---
-            angle_deviation = abs(clamped_angle - SERVO_CENTER_ANGLE)
-            if angle_deviation <= 8:
-                motor_speed = MOTOR_DRIVE_DC
-            else:
-                # Линейное снижение: при angle_deviation=8 — MOTOR_DRIVE_DC, при max — MOTOR_DRIVE_DC/1.5
-                max_deviation = max(
-                    abs(SERVO_MAX_ANGLE - SERVO_CENTER_ANGLE),
-                    abs(SERVO_MIN_ANGLE - SERVO_CENTER_ANGLE),
-                )
-                min_speed = MOTOR_DRIVE_DC / 1.5
-                # scale: 0 (8°) ... 1 (max_deviation)
-                scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
-                motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
-            self._set_motor_speed(motor_speed)
-            print(
-                f"[DEBUG] MOTOR_SPEED={motor_speed:.2f} (angle_deviation={angle_deviation:.1f})"
-            )
+            if ON_RASPBERRY:
+                angle_deviation = abs(clamped_angle - SERVO_CENTER_ANGLE)
+                if angle_deviation <= 8:
+                    motor_speed = self._drive_dc
+                else:
+                    max_deviation = max(abs(SERVO_MAX_ANGLE - SERVO_CENTER_ANGLE), abs(SERVO_MIN_ANGLE - SERVO_CENTER_ANGLE))
+                    min_speed = self._drive_dc / 1.5
+                    scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
+                    motor_speed = self._drive_dc - (self._drive_dc - min_speed) * scale
+                self._set_motor_speed(motor_speed)
+                print(f"[DEBUG] MOTOR_SPEED={motor_speed:.2f} (angle_deviation={angle_deviation:.1f}) [DRIVE_DC={self._drive_dc}]")
 
             if ON_RASPBERRY:
                 self._set_servo_angle(clamped_angle)
@@ -434,13 +449,6 @@ class CarController:
             #         if ON_RASPBERRY:
             #             self._set_motor_speed(MOTOR_START_DC)
             #             print("[DEBUG] MOTOR START")
-
-            # --- Обработка клавиши 's' для уменьшения скорости на 10 ---
-            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-                key = sys.stdin.read(1)
-                if key.lower() == 's':
-                    MOTOR_DRIVE_DC = max(0, MOTOR_DRIVE_DC - 10)
-                    print(f"[KEYBOARD] MOTOR_DRIVE_DC set to {MOTOR_DRIVE_DC}")
 
             print(
                 f"L: {left_row[3]} R: {right_row[0]} | Err: {error:.0f} | Adj: {steer_adjustment:.2f} | Angle: {clamped_angle:.1f}"
