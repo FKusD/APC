@@ -35,7 +35,7 @@ MOTOR_PIN = 6
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
 MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 30  # Рабочий газ (в процентах)
+MOTOR_DRIVE_DC = 15  # Рабочий газ (в процентах)
 # MOTOR_START_DC = 35 # Начальный газ для старта (в процентах)
 # MOTOR_DRIVE_DC = 20 # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0  # Газ при остановке
@@ -60,7 +60,7 @@ PID_COEFFS: List[Tuple[float, float, float]] = [
 
 # Коэффициент масштабирования для рулевого управления
 # Преобразует суммарную ошибку от ПИДов в градусы поворота сервы
-STEERING_SCALING_FACTOR = 0.22
+STEERING_SCALING_FACTOR = 0.1
 
 # --- КЛАСС ПИД-РЕГУЛЯТОРА ---
 
@@ -339,10 +339,10 @@ class CarController:
             )
 
             left_row = [
-                d if s != 255 else 4000 for d, s in zip(left_row, left_status_row)
+                d if s != 255 else 2000 for d, s in zip(left_row, left_status_row)
             ]
             right_row = [
-                d if s != 255 else 4000 for d, s in zip(right_row, right_status_row)
+                d if s != 255 else 2000 for d, s in zip(right_row, right_status_row)
             ]
 
             total_correction = 0.0
