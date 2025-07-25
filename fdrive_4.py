@@ -36,10 +36,10 @@ MOTOR_PIN = 6
 # Параметры ШИМ (PWM)
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
-MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 30  # Рабочий газ (в процентах)
+MOTOR_START_DC = 20  # Начальный газ для старта (в процентах)
+MOTOR_DRIVE_DC = 0.3  # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0    # Газ при остановке
-SPEED_STEP = 10       # Шаг изменения скорости клавишей 's'
+SPEED_STEP = 5       # Шаг изменения скорости клавишей 's'
 
 # Параметры сервопривода
 SERVO_MIN_ANGLE = 70  # Минимальный угол поворота
@@ -52,14 +52,14 @@ RIGHT_SENSOR_SHM = "vl53l5cx_right"
 
 # Коэффициенты для 4 ПИД-регуляторов (Kp, Ki, Kd)
 PID_COEFFS: List[Tuple[float, float, float]] = [
-    (0.03, 0.000, 0.000),  # E0: внешние лучи
-    (0.060, 0.000, 0.01),  # E1
-    (0.1, 0.003, 0.015),  # E2
-    (0.08, 0.000, 0.000),  # E3: внутренние лучи
+    (0.01, 0.000, 0.00),  # E0: внешние лучи
+    (0.01, 0.000, 0.00),  # E1 0.06
+    (0.01, 0.000, 0.00),  # E2 0.08
+    (0.01, 0.000, 0.00),  # E3: внутренние лучи 0.1
 ]
 
 # Коэффициент масштабирования для рулевого управления
-STEERING_SCALING_FACTOR = 0.11
+STEERING_SCALING_FACTOR = 0.15
 
 # --- КЛАСС ПИД-РЕГУЛЯТОРА ---
 
@@ -213,6 +213,7 @@ class CarController:
 
         self.pwm_servo.start(0)
         self.pwm_motor.start(0)
+        print("GPIO and PWM initialized.")
 
     def _set_servo_angle(self, angle: float):
         """Устанавливает угол поворота сервопривода."""
@@ -246,6 +247,7 @@ class CarController:
             GPIO.cleanup()
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
         self.sensor_reader.cleanup()
+        print("Cleanup complete. Exiting.")
 
     def run(self):
         """Основной цикл управления."""
@@ -255,14 +257,16 @@ class CarController:
         if ON_RASPBERRY:
             tty.setcbreak(sys.stdin.fileno())
             self._set_servo_angle(SERVO_CENTER_ANGLE)
+            print("Servo centered. Starting motor sequence...")
             self._set_motor_speed(MOTOR_START_DC)
             time.sleep(0.5)
             self._set_motor_speed(self.current_speed)
+            print(f"Motor running at {self.current_speed}% duty cycle.")
 
-        print("Car controller started. Press 's' to decrease speed, Ctrl+C to stop.")
+        print("Corridor following started. Press 's' to decrease speed, Ctrl+C to stop.")
 
         while self.running:
-            # Обработка нажатия клавиши 's'
+            # Обработка клавиши 's'
             key = self._get_key()
             if key == 's':
                 self.current_speed = max(0, self.current_speed - SPEED_STEP)
@@ -272,29 +276,42 @@ class CarController:
             elif key == '\x03':  # Ctrl+C
                 raise KeyboardInterrupt
 
-            # Основная логика управления
+            # Чтение данных с датчиков
             left_data = self.sensor_reader.read_sensor_data(LEFT_SENSOR_SHM)
             right_data = self.sensor_reader.read_sensor_data(RIGHT_SENSOR_SHM)
 
-            if not left_data or not right_data or not left_data.distances or not right_data.distances:
+            if (not left_data or not right_data or 
+                not left_data.distances or not right_data.distances):
+                print("Waiting for sensor data...", end="\r")
                 time.sleep(0.05)
                 continue
 
+            # Извлекаем 2-ю строку (индекс 1) из матрицы 4x4
             left_row = left_data.distances[4:8]
             right_row = right_data.distances[4:8]
             left_status_row = left_data.statuses[4:8]
             right_status_row = right_data.statuses[4:8]
 
-            left_row = [d if s != 255 else 1500 for d, s in zip(left_row, left_status_row)]
-            right_row = [d if s != 255 else 1500 for d, s in zip(right_row, right_status_row)]
+            # Обработка статусов
+            left_row = [d if s != 255 else 2500 for d, s in zip(left_row, left_status_row)]
+            right_row = [d if s != 255 else 2500 for d, s in zip(right_row, right_status_row)]
+
+            print(f"LEFT  2nd row: {[f'{v:4d}' for v in left_row]}")
+            print(f"RIGHT 2nd row: {[f'{v:4d}' for v in right_row]}")
 
             total_correction = 0.0
+            pid_debug_info = []
             for i in range(4):
                 dist_left = left_row[i]
                 dist_right = right_row[3 - i]
                 error = dist_left - dist_right
                 correction = self.pids[i].compute(setpoint=0, current_value=error)
                 total_correction += correction
+                pid_debug_info.append((i, error, correction))
+
+            print("PID details:")
+            for idx, err, corr in pid_debug_info:
+                print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f}")
 
             steer_adjustment = total_correction * STEERING_SCALING_FACTOR
             target_angle = SERVO_CENTER_ANGLE + steer_adjustment
@@ -303,7 +320,8 @@ class CarController:
             if ON_RASPBERRY:
                 self._set_servo_angle(clamped_angle)
 
-            print(f"L: {left_row[3]} R: {right_row[0]} | Angle: {clamped_angle:.1f} | Speed: {self.current_speed}%", end='\r')
+            print(f"L: {left_row[3]} R: {right_row[0]} | Err: {error:.0f} | Adj: {steer_adjustment:.2f} | Angle: {clamped_angle:.1f} | Speed: {self.current_speed}%")
+
             time.sleep(0.02)
 
 def main():
