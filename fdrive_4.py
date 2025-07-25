@@ -4,7 +4,7 @@
 """
 Основная программа управления беспилотным автомобилем.
 Осуществляет движение по коридору на основе данных с датчиков VL53L5CX.
-Добавлено управление скоростью по клавише 's'.
+Добавлено сглаживание данных датчиков.
 """
 
 import mmap
@@ -13,15 +13,13 @@ import time
 import struct
 import signal
 import sys
-import select
-import termios
-import tty
+import numpy as np
 from typing import Dict, Optional, List, Tuple
 import board
 from adafruit_bitbangio import I2C
 import adafruit_tcs34725
 
-# Подавление предупреждений от RPi.GPIO, если он недоступен
+# Подавление предупреждений от RPi.GPIO, если он недоступен (например, при разработке на ПК)
 try:
     import RPi.GPIO as GPIO
     import posix_ipc
@@ -39,10 +37,9 @@ MOTOR_PIN = 6
 # Параметры ШИМ (PWM)
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
-MOTOR_START_DC = 20  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 0.3  # Рабочий газ (в процентах)
+MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
+MOTOR_DRIVE_DC = 30  # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0    # Газ при остановке
-SPEED_STEP = 5       # Шаг изменения скорости клавишей 's'
 
 # Параметры сервопривода
 SERVO_MIN_ANGLE = 70  # Минимальный угол поворота
@@ -55,10 +52,10 @@ RIGHT_SENSOR_SHM = "vl53l5cx_right"
 
 # Коэффициенты для 4 ПИД-регуляторов (Kp, Ki, Kd)
 PID_COEFFS: List[Tuple[float, float, float]] = [
-    (0.01, 0.000, 0.00),  # E0: внешние лучи
-    (0.01, 0.000, 0.00),  # E1 0.06
-    (0.01, 0.000, 0.00),  # E2 0.08
-    (0.01, 0.000, 0.00),  # E3: внутренние лучи 0.1
+    (0.002, 0.008, 0.001),  # E0: внешние лучи
+    (0.003, 0.008, 0.001),  # E1 0.06 0 0.01
+    (0.002, 0.008, 0.002),  # E2 0.1 0.003 0.015
+    (0.001, 0.008, 0.002),  # E3: внутренние лучи 0.08
 ]
 
 # Коэффициент масштабирования для рулевого управления
@@ -199,6 +196,13 @@ class CarController:
         self.running = True
         self.sensor_reader = SensorReader()
         self.pids = [PIDController(*coeffs) for coeffs in PID_COEFFS]
+        self.start_time = None
+        self.end_time = None
+        # Буферы для сглаживания данных
+        self.buffer_size = 3
+        self.left_buffers = [[] for _ in range(4)]
+        self.right_buffers = [[] for _ in range(4)]
+
         
         # --- Инициализация датчика цвета ---
         self.i2c = I2C(board.D9, board.D10)
@@ -229,7 +233,6 @@ class CarController:
 
         self.pwm_servo.start(0)
         self.pwm_motor.start(0)
-        print("GPIO and PWM initialized.")
 
     def _set_servo_angle(self, angle: float):
         """Устанавливает угол поворота сервопривода."""
@@ -240,15 +243,36 @@ class CarController:
         """Устанавливает скорость мотора."""
         self.pwm_motor.ChangeDutyCycle(duty_cycle)
 
-    def _get_key(self):
-        """Неблокирующее чтение клавиш."""
-        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
-            return sys.stdin.read(1)
-        return None
+    def _smooth_sensor_data(self, values, statuses, buffers):
+        """Сглаживание данных датчиков."""
+        smoothed = []
+        for i in range(4):
+            if statuses[i] == 255:
+                current_value = 5500
+                add_to_buffer = True
+            else:
+                current_value = values[i]
+                add_to_buffer = True
+            
+            if add_to_buffer:
+                buffers[i].append(current_value)
+                if len(buffers[i]) > self.buffer_size:
+                    buffers[i].pop(0)
+            
+            if buffers[i]:
+                smoothed_value = np.median(buffers[i])
+            else:
+                smoothed_value = current_value
+            
+            smoothed.append(smoothed_value)
+        
+        return smoothed
 
     def signal_handler(self, signum, frame):
         """Обработчик сигналов для корректного завершения."""
         print(f"\nSignal {signum} received, stopping...")
+        self.end_time = time.time()
+        print("time: ",self.end_time - self.start_time)
         self.running = False
 
     def cleanup(self):
@@ -270,6 +294,8 @@ class CarController:
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
+        self.start_time = time.time()
+        print("Starting car controller...")
         if ON_RASPBERRY:
             tty.setcbreak(sys.stdin.fileno())
             self._set_servo_angle(SERVO_CENTER_ANGLE)
@@ -279,7 +305,7 @@ class CarController:
             self._set_motor_speed(self.current_speed)
             print(f"Motor running at {self.current_speed}% duty cycle.")
 
-        print("Corridor following started. Press 's' to decrease speed, Ctrl+C to stop.")
+        print("Corridor following started. Press Ctrl+C to stop.")
 
         while self.running:
             # Обработка клавиши 's'
@@ -303,40 +329,51 @@ class CarController:
                 continue
 
             # Извлекаем 2-ю строку (индекс 1) из матрицы 4x4
-            left_row = left_data.distances[4:8]
-            right_row = right_data.distances[4:8]
+            left_row_orig = left_data.distances[4:8]
+            right_row_orig = right_data.distances[4:8]
             left_status_row = left_data.statuses[4:8]
             right_status_row = right_data.statuses[4:8]
 
-            # Обработка статусов
-            left_row = [d if s != 255 else 2500 for d, s in zip(left_row, left_status_row)]
-            right_row = [d if s != 255 else 2500 for d, s in zip(right_row, right_status_row)]
+            # Сглаживание данных
+            left_row = self._smooth_sensor_data(
+                left_row_orig, left_status_row, self.left_buffers
+            )
+            right_row = self._smooth_sensor_data(
+                right_row_orig, right_status_row, self.right_buffers
+            )
 
-            print(f"LEFT  2nd row: {[f'{v:4d}' for v in left_row]}")
-            print(f"RIGHT 2nd row: {[f'{v:4d}' for v in right_row]}")
+            print(f"LEFT orig: {left_row_orig} smoothed: {left_row}")
+            print(f"RIGHT orig: {right_row_orig} smoothed: {right_row}")
 
             total_correction = 0.0
-            pid_debug_info = []
             for i in range(4):
                 dist_left = left_row[i]
                 dist_right = right_row[3 - i]
                 error = dist_left - dist_right
                 correction = self.pids[i].compute(setpoint=0, current_value=error)
                 total_correction += correction
-                pid_debug_info.append((i, error, correction))
-
-            print("PID details:")
-            for idx, err, corr in pid_debug_info:
-                print(f"  PID[{idx}]: error={err:5d}, output={corr:8.3f}")
 
             steer_adjustment = total_correction * STEERING_SCALING_FACTOR
             target_angle = SERVO_CENTER_ANGLE + steer_adjustment
             clamped_angle = max(SERVO_MIN_ANGLE, min(SERVO_MAX_ANGLE, target_angle))
 
+            angle_deviation = abs(clamped_angle - SERVO_CENTER_ANGLE)
+            if angle_deviation <= 8:
+                motor_speed = MOTOR_DRIVE_DC
+            else:
+                max_deviation = max(
+                    abs(SERVO_MAX_ANGLE - SERVO_CENTER_ANGLE),
+                    abs(SERVO_MIN_ANGLE - SERVO_CENTER_ANGLE),
+                )
+                min_speed = MOTOR_DRIVE_DC / 1.5
+                scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
+                motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
+
             if ON_RASPBERRY:
                 self._set_servo_angle(clamped_angle)
+                self._set_motor_speed(motor_speed)
 
-            print(f"L: {left_row[3]} R: {right_row[0]} | Err: {error:.0f} | Adj: {steer_adjustment:.2f} | Angle: {clamped_angle:.1f} | Speed: {self.current_speed}%")
+            print(f"Angle: {clamped_angle:.1f}° | Speed: {motor_speed:.1f}%")
 
             time.sleep(0.02)
 
@@ -408,6 +445,7 @@ def main():
     try:
         controller.run()
     except KeyboardInterrupt:
+
         print("\nKeyboardInterrupt caught.")
     finally:
         controller.cleanup()
