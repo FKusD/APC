@@ -15,6 +15,9 @@ import signal
 import sys
 import numpy as np
 from typing import Dict, Optional, List, Tuple
+import board
+from adafruit_bitbangio import I2C
+import adafruit_tcs34725
 
 # Подавление предупреждений от RPi.GPIO, если он недоступен (например, при разработке на ПК)
 try:
@@ -200,6 +203,21 @@ class CarController:
         self.left_buffers = [[] for _ in range(4)]
         self.right_buffers = [[] for _ in range(4)]
 
+        # --- Инициализация датчика цвета ---
+        self.i2c = I2C(board.D9, board.D10)
+        self.color_sensor = adafruit_tcs34725.TCS34725(self.i2c)
+        self.lux_buffer = []
+        self.lux_buffer_size = 5
+        self.lux_floor = None
+        self.lux_banner = None
+        self.lux_line = None
+        self.line_state = 'normal'  # normal, slow_for_stop, stop_on_line
+        self.line_detected_times = []
+        self.last_line_time = 0
+        self.line_detected = False
+        self.line_timer = None
+        self.stop_speed = 10  # скорость для "остановка на линии"
+        self.line_stop_timeout = 1.0  # сколько ждать широкой линии после двух тонких
         if ON_RASPBERRY:
             self._setup_gpio()
 
@@ -343,6 +361,68 @@ class CarController:
                 self._set_motor_speed(motor_speed)
 
             print(f"Angle: {clamped_angle:.1f}° | Speed: {motor_speed:.1f}%")
+
+            # --- Чтение и фильтрация lux с tcs34725 ---
+            try:
+                lux = self.color_sensor.lux
+            except Exception as e:
+                lux = 0
+            self.lux_buffer.append(lux)
+            if len(self.lux_buffer) > self.lux_buffer_size:
+                self.lux_buffer.pop(0)
+            lux_filt = sum(self.lux_buffer) / len(self.lux_buffer)
+            print(f"[TCS] lux={lux:.1f} filt={lux_filt:.1f}")
+
+            # --- Калибровка ---
+            if self.lux_floor is None and lux_filt < 400:
+                self.lux_floor = lux_filt
+                print(f"[TCS] Калибровка: пол, lux={lux_filt:.1f}")
+            if self.lux_banner is None and lux_filt > 450:
+                self.lux_banner = lux_filt
+                print(f"[TCS] Калибровка: баннер, lux={lux_filt:.1f}")
+            if self.lux_line is None and lux_filt < 150:
+                self.lux_line = lux_filt
+                print(f"[TCS] Калибровка: линия, lux={lux_filt:.1f}")
+
+            # --- Детекция линии ---
+            now = time.time()
+            is_line = False
+            if self.lux_banner and lux_filt < self.lux_banner * 0.4:
+                is_line = True
+            # --- Логика для тонких и широкой линии ---
+            if self.line_state == 'normal':
+                if is_line and not self.line_detected:
+                    self.line_detected = True
+                    self.line_detected_times.append(now)
+                    print(f"[TCS] Обнаружена линия! lux={lux_filt:.1f}")
+                    # Очищаем старые срабатывания
+                    self.line_detected_times = [t for t in self.line_detected_times if now - t < 1.0]
+                    if len(self.line_detected_times) == 2:
+                        print("[TCS] Две тонкие линии подряд: переходим в режим остановки на линии!")
+                        self.line_state = 'slow_for_stop'
+                        self.line_stop_start = now
+                if not is_line:
+                    self.line_detected = False
+            elif self.line_state == 'slow_for_stop':
+                # Снижаем скорость
+                self._drive_dc = self.stop_speed
+                if is_line:
+                    if self.line_timer is None:
+                        self.line_timer = now
+                    elif now - self.line_timer > 0.15:
+                        print("[TCS] Широкая линия: ОСТАНОВКА!")
+                        self.line_state = 'stop_on_line'
+                        self._drive_dc = 0
+                else:
+                    self.line_timer = None
+                # Если долго не встретили широкую линию — возвращаемся в normal
+                if now - self.line_stop_start > self.line_stop_timeout:
+                    print("[TCS] Время ожидания широкой линии истекло, возвращаемся в normal")
+                    self.line_state = 'normal'
+                    self._drive_dc = MOTOR_DRIVE_DC
+                    self.line_detected_times = []
+            elif self.line_state == 'stop_on_line':
+                self._drive_dc = 0
 
             time.sleep(0.02)
 
