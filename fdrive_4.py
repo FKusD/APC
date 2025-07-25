@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
@@ -284,7 +284,6 @@ class CarController:
             self.pwm_servo.stop()
             self.pwm_motor.stop()
             GPIO.cleanup()
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
         self.sensor_reader.cleanup()
         print("Cleanup complete. Exiting.")
 
@@ -296,27 +295,16 @@ class CarController:
         self.start_time = time.time()
         print("Starting car controller...")
         if ON_RASPBERRY:
-            tty.setcbreak(sys.stdin.fileno())
             self._set_servo_angle(SERVO_CENTER_ANGLE)
             print("Servo centered. Starting motor sequence...")
             self._set_motor_speed(MOTOR_START_DC)
             time.sleep(0.5)
-            self._set_motor_speed(self.current_speed)
-            print(f"Motor running at {self.current_speed}% duty cycle.")
+            self._set_motor_speed(MOTOR_DRIVE_DC)
+            print(f"Motor running at {MOTOR_DRIVE_DC}% duty cycle.")
 
         print("Corridor following started. Press Ctrl+C to stop.")
 
         while self.running:
-            # Обработка клавиши 's'
-            key = self._get_key()
-            if key == 's':
-                self.current_speed = max(0, self.current_speed - SPEED_STEP)
-                if ON_RASPBERRY:
-                    self._set_motor_speed(self.current_speed)
-                print(f"\nSpeed decreased to {self.current_speed}%")
-            elif key == '\x03':  # Ctrl+C
-                raise KeyboardInterrupt
-
             # Чтение данных с датчиков
             left_data = self.sensor_reader.read_sensor_data(LEFT_SENSOR_SHM)
             right_data = self.sensor_reader.read_sensor_data(RIGHT_SENSOR_SHM)
@@ -437,68 +425,6 @@ class CarController:
                 self._drive_dc = 0
 
             time.sleep(0.02)
-
-            # --- Чтение и фильтрация lux с tcs34725 ---
-            try:
-                lux = self.color_sensor.lux
-            except Exception as e:
-                lux = 0
-            self.lux_buffer.append(lux)
-            if len(self.lux_buffer) > self.lux_buffer_size:
-                self.lux_buffer.pop(0)
-            lux_filt = sum(self.lux_buffer) / len(self.lux_buffer)
-            print(f"[TCS] lux={lux:.1f} filt={lux_filt:.1f}")
-
-            # --- Калибровка ---
-            if self.lux_floor is None and lux_filt < 400:
-                self.lux_floor = lux_filt
-                print(f"[TCS] Калибровка: пол, lux={lux_filt:.1f}")
-            if self.lux_banner is None and lux_filt > 450:
-                self.lux_banner = lux_filt
-                print(f"[TCS] Калибровка: баннер, lux={lux_filt:.1f}")
-            if self.lux_line is None and lux_filt < 150:
-                self.lux_line = lux_filt
-                print(f"[TCS] Калибровка: линия, lux={lux_filt:.1f}")
-
-            # --- Детекция линии ---
-            now = time.time()
-            is_line = False
-            if self.lux_banner and lux_filt < self.lux_banner * 0.4:
-                is_line = True
-            # --- Логика для тонких и широкой линии ---
-            if self.line_state == 'normal':
-                if is_line and not self.line_detected:
-                    self.line_detected = True
-                    self.line_detected_times.append(now)
-                    print(f"[TCS] Обнаружена линия! lux={lux_filt:.1f}")
-                    # Очищаем старые срабатывания
-                    self.line_detected_times = [t for t in self.line_detected_times if now - t < 1.0]
-                    if len(self.line_detected_times) == 2:
-                        print("[TCS] Две тонкие линии подряд: переходим в режим остановки на линии!")
-                        self.line_state = 'slow_for_stop'
-                        self.line_stop_start = now
-                if not is_line:
-                    self.line_detected = False
-            elif self.line_state == 'slow_for_stop':
-                # Снижаем скорость
-                self._drive_dc = self.stop_speed
-                if is_line:
-                    if self.line_timer is None:
-                        self.line_timer = now
-                    elif now - self.line_timer > 0.15:
-                        print("[TCS] Широкая линия: ОСТАНОВКА!")
-                        self.line_state = 'stop_on_line'
-                        self._drive_dc = 0
-                else:
-                    self.line_timer = None
-                # Если долго не встретили широкую линию — возвращаемся в normal
-                if now - self.line_stop_start > self.line_stop_timeout:
-                    print("[TCS] Время ожидания широкой линии истекло, возвращаемся в normal")
-                    self.line_state = 'normal'
-                    self._drive_dc = MOTOR_DRIVE_DC
-                    self.line_detected_times = []
-            elif self.line_state == 'stop_on_line':
-                self._drive_dc = 0
 
 def main():
     """Главная функция."""
