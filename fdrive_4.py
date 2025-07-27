@@ -61,6 +61,12 @@ PID_COEFFS: List[Tuple[float, float, float]] = [
 # Коэффициент масштабирования для рулевого управления
 STEERING_SCALING_FACTOR = 0.15
 
+# Параметры обнаружения линии
+LUX_BUFFER_SIZE = 3  # Размер буфера для сглаживания lux
+BANNER_JUMP_THRESHOLD = 1.8  # Во сколько раз должен увеличиться lux для обнаружения баннера
+LINE_JUMP_THRESHOLD = 4.0  # Во сколько раз должен уменьшиться lux для обнаружения линии
+STABILITY_ITERATIONS = 2  # Сколько итераций должно пройти для подтверждения скачка
+
 # --- КЛАСС ПИД-РЕГУЛЯТОРА ---
 
 class PIDController:
@@ -206,18 +212,18 @@ class CarController:
         # --- Инициализация датчика цвета ---
         self.i2c = I2C(board.D9, board.D10)
         self.color_sensor = adafruit_tcs34725.TCS34725(self.i2c)
+        
+        # Буферы для нового алгоритма обнаружения линии
         self.lux_buffer = []
-        self.lux_buffer_size = 5
-        self.lux_floor = None
-        self.lux_banner = None
-        self.lux_line = None
-        self.line_state = 'normal'  # normal, slow_for_stop, stop_on_line
-        self.line_detected_times = []
-        self.last_line_time = 0
+        self.lux_buffer_size = LUX_BUFFER_SIZE
+        self.baseline_lux = None  # Базовое значение lux (пол)
+        self.banner_lux = None    # Значение lux на баннере
         self.line_detected = False
-        self.line_timer = None
-        self.stop_speed = 10  # скорость для "остановка на линии"
-        self.line_stop_timeout = 1.0  # сколько ждать широкой линии после двух тонких
+        self.banner_detected = False
+        self.jump_counter = 0     # Счётчик итераций для подтверждения скачка
+        self.last_lux = None      # Предыдущее значение lux
+        self.current_motor_speed = MOTOR_DRIVE_DC
+        # Удаляем старые переменные, которые больше не нужны
         if ON_RASPBERRY:
             self._setup_gpio()
 
@@ -356,11 +362,13 @@ class CarController:
                 scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
                 motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
 
-            if ON_RASPBERRY:
-                self._set_servo_angle(clamped_angle)
-                self._set_motor_speed(motor_speed)
+            # Обновляем текущую скорость мотора (если линия не обнаружена)
+            if not self.line_detected:
+                self.current_motor_speed = motor_speed
 
-            print(f"Angle: {clamped_angle:.1f}° | Speed: {motor_speed:.1f}%")
+            self._set_servo_angle(clamped_angle)
+
+            print(f"Angle: {clamped_angle:.1f}° | Speed: {self.current_motor_speed:.1f}%")
 
             # --- Чтение и фильтрация lux с tcs34725 ---
             try:
@@ -373,56 +381,50 @@ class CarController:
             lux_filt = sum(self.lux_buffer) / len(self.lux_buffer)
             print(f"[TCS] lux={lux:.1f} filt={lux_filt:.1f}")
 
-            # --- Калибровка ---
-            if self.lux_floor is None and lux_filt < 400:
-                self.lux_floor = lux_filt
-                print(f"[TCS] Калибровка: пол, lux={lux_filt:.1f}")
-            if self.lux_banner is None and lux_filt > 450:
-                self.lux_banner = lux_filt
-                print(f"[TCS] Калибровка: баннер, lux={lux_filt:.1f}")
-            if self.lux_line is None and lux_filt < 150:
-                self.lux_line = lux_filt
-                print(f"[TCS] Калибровка: линия, lux={lux_filt:.1f}")
+            # --- Калибровка базового значения ---
+            if self.baseline_lux is None and lux_filt < 400:
+                self.baseline_lux = lux_filt
+                print(f"[TCS] Калибровка: базовое значение lux={lux_filt:.1f}")
 
-            # --- Детекция линии ---
-            now = time.time()
-            is_line = False
-            if self.lux_banner and lux_filt < self.lux_banner * 0.4:
-                is_line = True
-            # --- Логика для тонких и широкой линии ---
-            if self.line_state == 'normal':
-                if is_line and not self.line_detected:
-                    self.line_detected = True
-                    self.line_detected_times.append(now)
-                    print(f"[TCS] Обнаружена линия! lux={lux_filt:.1f}")
-                    # Очищаем старые срабатывания
-                    self.line_detected_times = [t for t in self.line_detected_times if now - t < 1.0]
-                    if len(self.line_detected_times) == 2:
-                        print("[TCS] Две тонкие линии подряд: переходим в режим остановки на линии!")
-                        self.line_state = 'slow_for_stop'
-                        self.line_stop_start = now
-                if not is_line:
-                    self.line_detected = False
-            elif self.line_state == 'slow_for_stop':
-                # Снижаем скорость
-                self._drive_dc = self.stop_speed
-                if is_line:
-                    if self.line_timer is None:
-                        self.line_timer = now
-                    elif now - self.line_timer > 0.15:
-                        print("[TCS] Широкая линия: ОСТАНОВКА!")
-                        self.line_state = 'stop_on_line'
-                        self._drive_dc = 0
-                else:
-                    self.line_timer = None
-                # Если долго не встретили широкую линию — возвращаемся в normal
-                if now - self.line_stop_start > self.line_stop_timeout:
-                    print("[TCS] Время ожидания широкой линии истекло, возвращаемся в normal")
-                    self.line_state = 'normal'
-                    self._drive_dc = MOTOR_DRIVE_DC
-                    self.line_detected_times = []
-            elif self.line_state == 'stop_on_line':
-                self._drive_dc = 0
+            # --- Новый алгоритм обнаружения линии ---
+            if self.baseline_lux is not None and self.last_lux is not None:
+                # Проверяем скачок вверх (баннер)
+                if not self.banner_detected:
+                    lux_ratio = lux_filt / self.baseline_lux
+                    if lux_ratio > BANNER_JUMP_THRESHOLD:
+                        self.jump_counter += 1
+                        if self.jump_counter >= STABILITY_ITERATIONS:
+                            self.banner_detected = True
+                            self.banner_lux = lux_filt
+                            print(f"[TCS] Обнаружен баннер! lux={lux_filt:.1f} (в {lux_ratio:.1f} раз больше)")
+                            self.jump_counter = 0
+                    else:
+                        self.jump_counter = 0
+                
+                # Проверяем скачок вниз (линия на баннере)
+                elif self.banner_detected and not self.line_detected:
+                    lux_ratio = self.banner_lux / lux_filt
+                    if lux_ratio > LINE_JUMP_THRESHOLD:
+                        self.jump_counter += 1
+                        if self.jump_counter >= STABILITY_ITERATIONS:
+                            self.line_detected = True
+                            print(f"[TCS] Обнаружена линия! lux={lux_filt:.1f} (в {lux_ratio:.1f} раз меньше)")
+                            self.current_motor_speed = 0  # Останавливаемся
+                            self.jump_counter = 0
+                    else:
+                        self.jump_counter = 0
+
+            self.last_lux = lux_filt
+
+            # Применяем скорость мотора
+            if self.line_detected:
+                self._set_motor_speed(0)
+            else:
+                self._set_motor_speed(self.current_motor_speed)
+
+            # Сброс состояния при нажатии Ctrl+C (для тестирования)
+            if self.line_detected:
+                print("[TCS] Линия обнаружена! Автомобиль остановлен. Нажмите Ctrl+C для сброса.")
 
             time.sleep(0.02)
 
