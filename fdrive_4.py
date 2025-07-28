@@ -33,12 +33,13 @@ except (ImportError, ModuleNotFoundError):
 # Пины GPIO
 SERVO_PIN = 18
 MOTOR_PIN = 6
+MOTOR_BACK_PIN = 12
 
 # Параметры ШИМ (PWM)
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
 MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 30  # Рабочий газ (в процентах)
+MOTOR_DRIVE_DC = 25  # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0    # Газ при остановке
 
 # Параметры сервопривода
@@ -52,20 +53,20 @@ RIGHT_SENSOR_SHM = "vl53l5cx_right"
 
 # Коэффициенты для 4 ПИД-регуляторов (Kp, Ki, Kd)
 PID_COEFFS: List[Tuple[float, float, float]] = [
-    (0.002, 0.008, 0.001),  # E0: внешние лучи
-    (0.003, 0.008, 0.001),  # E1 0.06 0 0.01
-    (0.002, 0.008, 0.002),  # E2 0.1 0.003 0.015
-    (0.001, 0.008, 0.002),  # E3: внутренние лучи 0.08
+    (0.014, 0.002, 0.001),  # E0: внешние лучи
+    (0.012, 0.002, 0.001),  # E1 0.06 0 0.01
+    (0.008, 0.002, 0.001),  # E2 0.1 0.003 0.015
+    (0.003, 0.002, 0.001),  # E3: внутренние лучи 0.08
 ]
 
 # Коэффициент масштабирования для рулевого управления
-STEERING_SCALING_FACTOR = 0.15
+STEERING_SCALING_FACTOR = 0.22
 
 # Параметры обнаружения линии
 LUX_BUFFER_SIZE = 3  # Размер буфера для сглаживания lux
-BANNER_JUMP_THRESHOLD = 1.8  # Во сколько раз должен увеличиться lux для обнаружения баннера
-LINE_JUMP_THRESHOLD = 4.0  # Во сколько раз должен уменьшиться lux для обнаружения линии
-STABILITY_ITERATIONS = 2  # Сколько итераций должно пройти для подтверждения скачка
+BANNER_JUMP_THRESHOLD = 1.6  # Во сколько раз должен увеличиться lux для обнаружения баннера
+LINE_JUMP_THRESHOLD = 1.6  # Во сколько раз должен уменьшиться lux для обнаружения линии
+STABILITY_ITERATIONS = 1  # Сколько итераций должно пройти для подтверждения скачка
 LINE_COUNT_TIMEOUT = 0.3  # Лимит времени для обнаружения 1-2 линий (в секундах)
 LINE_DETECTION_DELAY = 1.5  # Задержка обнаружения линий после старта (в секундах)
 
@@ -241,12 +242,15 @@ class CarController:
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(SERVO_PIN, GPIO.OUT)
         GPIO.setup(MOTOR_PIN, GPIO.OUT)
+        GPIO.setup(MOTOR_BACK_PIN, GPIO.OUT)
 
         self.pwm_servo = GPIO.PWM(SERVO_PIN, PWM_FREQUENCY_SERVO)
         self.pwm_motor = GPIO.PWM(MOTOR_PIN, PWM_FREQUENCY)
+        self.pwm_back_motor = GPIO.PWM(MOTOR_BACK_PIN, PWM_FREQUENCY)
 
         self.pwm_servo.start(0)
         self.pwm_motor.start(0)
+        self.pwm_back_motor.start(0)
 
     def _set_servo_angle(self, angle: float):
         """Устанавливает угол поворота сервопривода."""
@@ -255,6 +259,10 @@ class CarController:
 
     def _set_motor_speed(self, duty_cycle: float):
         """Устанавливает скорость мотора."""
+        self.pwm_motor.ChangeDutyCycle(duty_cycle)
+
+    def _set_braking_duty(self, duty_cycle: float):
+        self.pwm_back_motor.ChangeDutyCycle(duty_cycle)
         self.pwm_motor.ChangeDutyCycle(duty_cycle)
 
     def _reset_line_detection(self):
@@ -306,9 +314,11 @@ class CarController:
         print("Cleaning up resources...")
         if ON_RASPBERRY:
             self._set_motor_speed(MOTOR_STOP_DC)
+            self.pwm_back_motor.ChangeDutyCycle(0)
             self._set_servo_angle(SERVO_CENTER_ANGLE)
             time.sleep(0.25)
             self.pwm_servo.stop()
+            self.pwm_back_motor.stop()
             self.pwm_motor.stop()
             GPIO.cleanup()
         self.sensor_reader.cleanup()
@@ -330,6 +340,8 @@ class CarController:
             print(f"Motor running at {MOTOR_DRIVE_DC}% duty cycle.")
 
         print("Corridor following started. Press Ctrl+C to stop.")
+
+        stop_flag = False
 
         while self.running:
             # Чтение данных с датчиков
@@ -355,6 +367,8 @@ class CarController:
             right_row = self._smooth_sensor_data(
                 right_row_orig, right_status_row, self.right_buffers
             )
+
+            print(f"TIME: {time.time() - self.start_time}")
 
             print(f"LEFT orig: {left_row_orig} smoothed: {left_row}")
             print(f"RIGHT orig: {right_row_orig} smoothed: {right_row}")
@@ -384,8 +398,8 @@ class CarController:
                 motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
 
             # Обновляем текущую скорость мотора (если линия не обнаружена)
-            if not self.line_detected:
-                self.current_motor_speed = motor_speed
+            # if not self.line_detected:
+            self.current_motor_speed = motor_speed
 
             self._set_servo_angle(clamped_angle)
 
@@ -403,7 +417,7 @@ class CarController:
             print(f"[TCS] lux={lux:.1f} filt={lux_filt:.1f}")
 
             # --- Калибровка базового значения ---
-            if self.baseline_lux is None and lux_filt < 400:
+            if self.baseline_lux is None and lux_filt < 600:
                 self.baseline_lux = lux_filt
                 print(f"[TCS] Калибровка: базовое значение lux={lux_filt:.1f}")
 
@@ -416,11 +430,16 @@ class CarController:
                 if time_since_start >= LINE_DETECTION_DELAY:
                     self.line_detection_enabled = True
                     print(f"[TCS] Обнаружение линий включено (прошло {time_since_start:.1f}с)")
+
+            if self.banner_detected and now - self.start_time >= 2:
+                self._set_motor_speed(0)
+                stop_flag = True
+                # break
             
             # Проверяем, не уехали ли мы с баннера
             if self.banner_detected and self.baseline_lux is not None:
                 lux_ratio_to_baseline = lux_filt / self.baseline_lux
-                if lux_ratio_to_baseline < 1.5:  # Вернулись к базовому уровню
+                if lux_ratio_to_baseline < 1.1:  # Вернулись к базовому уровню
                     print(f"[TCS] Уехали с баннера, сбрасываем состояние. lux={lux_filt:.1f}")
                     self._reset_line_detection()
             
@@ -428,6 +447,7 @@ class CarController:
                 # Проверяем скачок вверх (баннер)
                 if not self.banner_detected:
                     lux_ratio = lux_filt / self.baseline_lux
+                    print(f"lux ratio: {lux_ratio}")
                     if lux_ratio > BANNER_JUMP_THRESHOLD:
                         self.jump_counter += 1
                         if self.jump_counter >= STABILITY_ITERATIONS:
@@ -441,6 +461,7 @@ class CarController:
                 # Проверяем скачок вниз (линия на баннере)
                 elif self.banner_detected:
                     lux_ratio = self.banner_lux / lux_filt
+                    print(f"lux ration line: {lux_ratio}")
                     if lux_ratio > LINE_JUMP_THRESHOLD:
                         self.jump_counter += 1
                         if self.jump_counter >= STABILITY_ITERATIONS:
@@ -483,7 +504,12 @@ class CarController:
             self.last_lux = lux_filt
 
             # Применяем скорость мотора в зависимости от статуса
-            if self.line_detected:
+            if now - self.start_time > 3: # < 6 and stop_flag:
+                print("STOOOP")
+                self._set_braking_duty(10)
+
+            elif now - self.start_time > 4:
+                print("Free rotate")
                 self._set_motor_speed(0)
             else:
                 self._set_motor_speed(self.current_motor_speed)
@@ -496,7 +522,7 @@ class CarController:
             if self.line_detected:
                 print("[TCS] Линия обнаружена! Автомобиль остановлен. Нажмите Ctrl+C для сброса.")
 
-            time.sleep(0.02)
+            # time.sleep(0.02)
 
 def main():
     """Главная функция."""
