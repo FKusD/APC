@@ -66,6 +66,8 @@ LUX_BUFFER_SIZE = 3  # Размер буфера для сглаживания l
 BANNER_JUMP_THRESHOLD = 1.8  # Во сколько раз должен увеличиться lux для обнаружения баннера
 LINE_JUMP_THRESHOLD = 4.0  # Во сколько раз должен уменьшиться lux для обнаружения линии
 STABILITY_ITERATIONS = 2  # Сколько итераций должно пройти для подтверждения скачка
+LINE_COUNT_TIMEOUT = 0.3  # Лимит времени для обнаружения 1-2 линий (в секундах)
+LINE_DETECTION_DELAY = 1.5  # Задержка обнаружения линий после старта (в секундах)
 
 # --- КЛАСС ПИД-РЕГУЛЯТОРА ---
 
@@ -223,6 +225,13 @@ class CarController:
         self.jump_counter = 0     # Счётчик итераций для подтверждения скачка
         self.last_lux = None      # Предыдущее значение lux
         self.current_motor_speed = MOTOR_DRIVE_DC
+        
+        # Переменные для подсчёта линий
+        self.line_count = 0       # Количество обнаруженных линий
+        self.line_start_time = None  # Время начала обнаружения линий
+        self.last_line_time = None   # Время последней обнаруженной линии
+        self.line_status = 'normal'  # normal, slow_for_stop, stop_on_line
+        self.line_detection_enabled = False  # Флаг включения обнаружения линий
         # Удаляем старые переменные, которые больше не нужны
         if ON_RASPBERRY:
             self._setup_gpio()
@@ -247,6 +256,18 @@ class CarController:
     def _set_motor_speed(self, duty_cycle: float):
         """Устанавливает скорость мотора."""
         self.pwm_motor.ChangeDutyCycle(duty_cycle)
+
+    def _reset_line_detection(self):
+        """Сброс состояния обнаружения линий."""
+        self.line_count = 0
+        self.line_start_time = None
+        self.last_line_time = None
+        self.line_status = 'normal'
+        self.line_detected = False
+        self.banner_detected = False
+        self.line_detection_enabled = False  # Отключаем обнаружение до следующего старта
+        self.current_motor_speed = MOTOR_DRIVE_DC
+        print("[TCS] Состояние обнаружения линий сброшено")
 
     def _smooth_sensor_data(self, values, statuses, buffers):
         """Сглаживание данных датчиков."""
@@ -386,8 +407,24 @@ class CarController:
                 self.baseline_lux = lux_filt
                 print(f"[TCS] Калибровка: базовое значение lux={lux_filt:.1f}")
 
-            # --- Новый алгоритм обнаружения линии ---
-            if self.baseline_lux is not None and self.last_lux is not None:
+            # --- Новый алгоритм обнаружения линии с подсчётом ---
+            now = time.time()
+            
+            # Проверяем, прошло ли достаточно времени после старта
+            if not self.line_detection_enabled:
+                time_since_start = now - self.start_time
+                if time_since_start >= LINE_DETECTION_DELAY:
+                    self.line_detection_enabled = True
+                    print(f"[TCS] Обнаружение линий включено (прошло {time_since_start:.1f}с)")
+            
+            # Проверяем, не уехали ли мы с баннера
+            if self.banner_detected and self.baseline_lux is not None:
+                lux_ratio_to_baseline = lux_filt / self.baseline_lux
+                if lux_ratio_to_baseline < 1.5:  # Вернулись к базовому уровню
+                    print(f"[TCS] Уехали с баннера, сбрасываем состояние. lux={lux_filt:.1f}")
+                    self._reset_line_detection()
+            
+            if self.baseline_lux is not None and self.last_lux is not None and self.line_detection_enabled:
                 # Проверяем скачок вверх (баннер)
                 if not self.banner_detected:
                     lux_ratio = lux_filt / self.baseline_lux
@@ -402,26 +439,59 @@ class CarController:
                         self.jump_counter = 0
                 
                 # Проверяем скачок вниз (линия на баннере)
-                elif self.banner_detected and not self.line_detected:
+                elif self.banner_detected:
                     lux_ratio = self.banner_lux / lux_filt
                     if lux_ratio > LINE_JUMP_THRESHOLD:
                         self.jump_counter += 1
                         if self.jump_counter >= STABILITY_ITERATIONS:
-                            self.line_detected = True
-                            print(f"[TCS] Обнаружена линия! lux={lux_filt:.1f} (в {lux_ratio:.1f} раз меньше)")
-                            self.current_motor_speed = 0  # Останавливаемся
+                            # Обнаружена линия
+                            self.line_count += 1
+                            self.last_line_time = now
+                            
+                            # Инициализируем время начала, если это первая линия
+                            if self.line_start_time is None:
+                                self.line_start_time = now
+                            
+                            print(f"[TCS] Линия #{self.line_count} обнаружена! lux={lux_filt:.1f} (в {lux_ratio:.1f} раз меньше)")
+                            
+                            # Проверяем временной лимит для первых линий
+                            if self.line_count <= 2:
+                                time_since_start = now - self.line_start_time
+                                if time_since_start > LINE_COUNT_TIMEOUT:
+                                    print(f"[TCS] Превышен временной лимит ({LINE_COUNT_TIMEOUT}с) для {self.line_count} линий")
+                                    self._reset_line_detection()
+                                    self.jump_counter = 0
+                                    continue
+                            
+                            # Изменяем статус в зависимости от количества линий
+                            if self.line_count == 1:
+                                self.line_status = 'normal'
+                                print("[TCS] Первая линия - продолжаем движение")
+                            elif self.line_count == 2:
+                                self.line_status = 'slow_for_stop'
+                                self.current_motor_speed = MOTOR_DRIVE_DC / 2  # Снижаем скорость
+                                print("[TCS] Вторая линия - снижаем скорость")
+                            elif self.line_count >= 3:
+                                self.line_status = 'stop_on_line'
+                                self.line_detected = True
+                                print("[TCS] Третья линия - ОСТАНОВКА!")
+                            
                             self.jump_counter = 0
                     else:
                         self.jump_counter = 0
 
             self.last_lux = lux_filt
 
-            # Применяем скорость мотора
+            # Применяем скорость мотора в зависимости от статуса
             if self.line_detected:
                 self._set_motor_speed(0)
             else:
                 self._set_motor_speed(self.current_motor_speed)
 
+            # Вывод информации о статусе
+            if self.line_count > 0:
+                print(f"[TCS] Статус: {self.line_status}, линий: {self.line_count}")
+            
             # Сброс состояния при нажатии Ctrl+C (для тестирования)
             if self.line_detected:
                 print("[TCS] Линия обнаружена! Автомобиль остановлен. Нажмите Ctrl+C для сброса.")
