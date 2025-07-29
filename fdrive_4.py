@@ -28,14 +28,17 @@ except (ImportError, ModuleNotFoundError):
 
 # Пины GPIO
 SERVO_PIN = 18
+MOTOR_BACK_PIN = 12
 MOTOR_PIN = 6
 
 # Параметры ШИМ (PWM)
 PWM_FREQUENCY = 5000  # Гц, стандарт для сервоприводов
 PWM_FREQUENCY_SERVO = 50
 MOTOR_START_DC = 60  # Начальный газ для старта (в процентах)
-MOTOR_DRIVE_DC = 10 # Рабочий газ (в процентах)
+MOTOR_DRIVE_DC = 33 # Рабочий газ (в процентах)
 MOTOR_STOP_DC = 0    # Газ при остановке
+
+TIME_TO_STOP = 3.38
 
 # Параметры сервопривода
 SERVO_MIN_ANGLE = 70  # Минимальный угол поворота
@@ -48,8 +51,8 @@ RIGHT_SENSOR_SHM = "vl53l5cx_right"
 
 # Коэффициенты для 4 ПИД-регуляторов (Kp, Ki, Kd)
 PID_COEFFS: List[Tuple[float, float, float]] = [
-    (0.008, 0.002, 0.001),  # E0: внешние лучи
-    (0.011, 0.002, 0.001),  # E1 0.06 0 0.01
+    (0.010, 0.002, 0.001),  # E0: внешние лучи
+    (0.009, 0.002, 0.001),  # E1 0.06 0 0.01
     (0.008, 0.002, 0.002),  # E2 0.1 0.003 0.015
     (0.003, 0.002, 0.001),  # E3: внутренние лучи 0.08
 ]
@@ -205,13 +208,16 @@ class CarController:
         """Настройка GPIO пинов и ШИМ."""
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(SERVO_PIN, GPIO.OUT)
+        GPIO.setup(MOTOR_BACK_PIN, GPIO.OUT)
         GPIO.setup(MOTOR_PIN, GPIO.OUT)
 
         self.pwm_servo = GPIO.PWM(SERVO_PIN, PWM_FREQUENCY_SERVO)
+        self.pwm_back_motor = GPIO.PWM(MOTOR_BACK_PIN, PWM_FREQUENCY)
         self.pwm_motor = GPIO.PWM(MOTOR_PIN, PWM_FREQUENCY)
 
         self.pwm_servo.start(0)
         self.pwm_motor.start(0)
+        self.pwm_back_motor.start(0)
 
     def _set_servo_angle(self, angle: float):
         """Устанавливает угол поворота сервопривода."""
@@ -221,6 +227,10 @@ class CarController:
     def _set_motor_speed(self, duty_cycle: float):
         """Устанавливает скорость мотора."""
         self.pwm_motor.ChangeDutyCycle(duty_cycle)
+
+    def _set_braking_duty(self, duty_cycle: float):
+        self.pwm_motor.ChangeDutyCycle(duty_cycle)
+        self.pwm_back_motor.ChangeDutyCycle(duty_cycle)
 
     def _smooth_sensor_data(self, values, statuses, buffers):
         """Сглаживание данных датчиков."""
@@ -336,9 +346,11 @@ class CarController:
                 scale = min(1.0, (angle_deviation - 8) / (max_deviation - 8))
                 motor_speed = MOTOR_DRIVE_DC - (MOTOR_DRIVE_DC - min_speed) * scale
 
-            if ON_RASPBERRY:
-                self._set_servo_angle(clamped_angle)
-                self._set_motor_speed(motor_speed)
+            if time.time() - self.start_time > TIME_TO_STOP:
+                motor_speed = 0
+
+            self._set_servo_angle(clamped_angle)
+            self._set_motor_speed(motor_speed)
 
             print(f"Angle: {clamped_angle:.1f}° | Speed: {motor_speed:.1f}%")
 
